@@ -13,6 +13,7 @@ import models, database
 from routers import user, auth, face, paramedic, admin
 from email.mime.text import MIMEText
 import smtplib
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
 # Create all tables that do not already exist.
@@ -275,10 +276,10 @@ def build_html(data: Report):
     """
 @app.post("/send-report-email")
 def send_email(data: Report):
-    sender = "medicalSystemJo@gmail.com"
-    password = "rddkhpllsfawjjvo"
+    sender = os.getenv("SENDER_EMAIL")
+    password = os.getenv("APP_PASSWORD")
 
-    receiver = "medicalSystemJo@gmail.com"
+    receiver = os.getenv("SENDER_EMAIL")
 
     html = build_html(data)
 
