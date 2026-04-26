@@ -9,25 +9,26 @@ from PIL import Image, ImageOps
 import io
 
 
+# 🔥 تحميل المودل مرة وحدة فقط
+face_app = None
+
+def get_face_app():
+    global face_app
+    if face_app is None:
+        print("🚀 Loading InsightFace ONCE...")
+        face_app = FaceAnalysis(
+            name="buffalo_l",
+            providers=["CPUExecutionProvider"]  # 👈 بدون GPU
+        )
+        face_app.prepare(ctx_id=0, det_size=(640, 640))
+        print("✅ InsightFace Ready!")
+    return face_app
+
+
 class FaceEngine:
     def __init__(self):
-        print("⏳ Loading InsightFace Model...")
-        # CONFLICT RESOLVED:
-        #   Codebase A listed ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        #   Codebase B listed only ["CPUExecutionProvider"]
-        #   Decision: keep both providers in priority order (Codebase A).
-        #   On machines without a GPU, ONNX Runtime automatically falls back
-        #   to CPU — no harm done. On GPU machines, performance is much better.
-        self.app = FaceAnalysis(
-            name      = "buffalo_l",
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
-        self.app.prepare(ctx_id=0, det_size=(640, 640))
-        print("✅ InsightFace Ready!")
+        self.app = get_face_app()
 
-    # ---------------------------------------------------------
-    # 1. Extract face vector from an RGB image array
-    # ---------------------------------------------------------
     def get_encoding(self, img_rgb: np.ndarray) -> dict:
         try:
             faces = self.app.get(img_rgb)
@@ -38,24 +39,13 @@ class FaceEngine:
                 return {"status": "multiple_faces"}
 
             return {
-                "status":   "ok",
+                "status": "ok",
                 "encoding": faces[0].embedding.tolist()
             }
         except Exception as e:
             print(f"❌ Encoding Error: {e}")
             return {"status": "error"}
 
-    # ---------------------------------------------------------
-    # 2. Decode Base64 image string → RGB ndarray
-    #
-    # CONFLICT RESOLVED:
-    #   Codebase A used PIL + ImageOps.exif_transpose to correctly handle
-    #   phone camera EXIF rotation metadata before passing to InsightFace.
-    #   Codebase B used raw cv2.imdecode (no EXIF correction).
-    #   Decision: keep Codebase A's PIL-based approach — phone photos
-    #   frequently arrive rotated 90°; without EXIF correction InsightFace
-    #   will fail to detect the face.
-    # ---------------------------------------------------------
     def decode_base64(self, base64_str: str):
         try:
             if "," in base64_str:
@@ -63,27 +53,13 @@ class FaceEngine:
             img_data = base64.b64decode(base64_str)
 
             img = Image.open(io.BytesIO(img_data))
-            img = ImageOps.exif_transpose(img)          # correct phone rotation
+            img = ImageOps.exif_transpose(img)
             img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         except Exception as e:
             print(f"❌ Decode Error: {e}")
             return None
 
-    # ---------------------------------------------------------
-    # 3. Find the closest face match using pgvector
-    #
-    # CONFLICT RESOLVED:
-    #   Codebase A used SQLAlchemy ORM cosine_distance() — cleaner and
-    #   SQL-injection-safe.
-    #   Codebase B used raw f-string SQL with the vector embedded directly
-    #   in the query string — potential SQL injection risk.
-    #   Decision: keep Codebase A's ORM approach.
-    #
-    #   Threshold: Codebase A used 0.6, Codebase B used 0.4.
-    #   Decision: keep 0.6 as the default (less false positives).
-    #   The paramedic /scan endpoint in paramedic.py passes threshold=0.6.
-    # ---------------------------------------------------------
     def find_match(self, img_rgb: np.ndarray, db: Session, threshold: float = 0.6) -> dict:
         result = self.get_encoding(img_rgb)
         if result["status"] != "ok":
@@ -92,7 +68,7 @@ class FaceEngine:
         encoding = result["encoding"]
 
         try:
-            dist_col   = FaceScan.encoding.cosine_distance(encoding).label("dist")
+            dist_col = FaceScan.encoding.cosine_distance(encoding).label("dist")
             result_row = (
                 db.query(FaceScan, dist_col)
                 .filter(FaceScan.encoding.is_not(None))
@@ -104,7 +80,7 @@ class FaceEngine:
                 return {"status": "empty_db"}
 
             row, distance = result_row
-            similarity    = 1 - float(distance)
+            similarity = 1 - float(distance)
 
             if similarity < threshold:
                 return {"status": "unknown"}
@@ -116,11 +92,11 @@ class FaceEngine:
                 child = db.query(Child).filter(Child.childid == row.childid).first()
                 if child:
                     return {
-                        "status":      "found",
-                        "type":        "child",
-                        "name":        child.fullname,
+                        "status": "found",
+                        "type": "child",
+                        "name": child.fullname,
                         "identity_id": child.nationalityid,
-                        "accuracy":    accuracy
+                        "accuracy": accuracy
                     }
 
             elif row.userid:
@@ -128,11 +104,11 @@ class FaceEngine:
                 user = db.query(User).filter(User.userid == row.userid).first()
                 if user:
                     return {
-                        "status":      "found",
-                        "type":        "user",
-                        "name":        user.fullname,
+                        "status": "found",
+                        "type": "user",
+                        "name": user.fullname,
                         "identity_id": user.email,
-                        "accuracy":    accuracy
+                        "accuracy": accuracy
                     }
 
             return {"status": "unknown"}
@@ -141,27 +117,17 @@ class FaceEngine:
             print(f"❌ Search Error: {e}")
             return {"status": "error"}
 
-    # ---------------------------------------------------------
-    # 4. Duplicate face check
-    #
-    # CONFLICT RESOLVED:
-    #   Codebase A used ORM-based query with is_distinct_from() (safe).
-    #   Codebase B used raw f-string SQL (injection risk).
-    #   Threshold: A used 0.45, B used 0.50.
-    #   Decision: keep Codebase A's ORM approach and 0.45 threshold
-    #   (stricter — prevents more duplicates slipping through).
-    # ---------------------------------------------------------
     def is_duplicate(
         self,
-        encoding       : list,
-        db             : Session,
-        threshold      : float = 0.45,
-        exclude_userid : int   = None,
-        exclude_childid: int   = None
+        encoding: list,
+        db: Session,
+        threshold: float = 0.45,
+        exclude_userid: int = None,
+        exclude_childid: int = None
     ) -> bool:
         try:
             dist_col = FaceScan.encoding.cosine_distance(encoding).label("dist")
-            query    = db.query(dist_col).filter(FaceScan.encoding.is_not(None))
+            query = db.query(dist_col).filter(FaceScan.encoding.is_not(None))
 
             if exclude_userid:
                 query = query.filter(FaceScan.userid.is_distinct_from(exclude_userid))
@@ -178,8 +144,8 @@ class FaceEngine:
 
         except Exception as e:
             print(f"❌ Duplicate Check Error: {e}")
-            return False   # fail-open here; face router raises 400 on True
+            return False
 
 
-# Single shared instance — imported by all routers
+# 🔥 instance واحد فقط
 face_engine = FaceEngine()
